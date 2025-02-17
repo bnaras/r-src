@@ -1,17 +1,11 @@
 use std::{
     collections::HashMap,
-    ffi::{OsStr, OsString},
-    io,
-    path::Path,
+    io, env,
+    path::{Path, PathBuf},
     process::Command,
 };
 
-#[cfg(target_family = "unix")]
-use std::os::unix::ffi::OsStrExt;
-
-#[cfg(target_family = "windows")]
-use std::os::windows::ffi::OsStringExt;
-
+/// Holds key/value pairs parsed from "R CMD config --all".
 #[derive(Debug)]
 struct ConfigVariables {
     map: HashMap<String, String>,
@@ -19,160 +13,88 @@ struct ConfigVariables {
 
 impl ConfigVariables {
     fn get_r_cmd_config(&self, key: &str) -> String {
-        match self.map.get(key) {
-            Some(value) => value.to_string(),
-            None => String::from(""),
-        }
+        self.map.get(key).cloned().unwrap_or_default()
     }
 }
 
-// frustratingly, something like the following does not exist in an
-// OS-independent way in Rust
-#[cfg(target_family = "unix")]
-fn byte_array_to_os_string(bytes: &[u8]) -> OsString {
-    let os_str = OsStr::from_bytes(bytes);
-    os_str.to_os_string()
-}
-
-#[link(name = "kernel32")]
-#[cfg(target_family = "windows")]
-extern "system" {
-    #[link_name = "GetConsoleCP"]
-    fn get_console_code_page() -> u32;
-    #[link_name = "MultiByteToWideChar"]
-    fn multi_byte_to_wide_char(
-        CodePage: u32,
-        dwFlags: u32,
-        lpMultiByteStr: *const u8,
-        cbMultiByte: i32,
-        lpWideCharStr: *mut u16,
-        cchWideChar: i32,
-    ) -> i32;
-}
-
-// convert bytes to wide-encoded characters on Windows
-// from: https://stackoverflow.com/a/40456495/4975218
-#[cfg(target_family = "windows")]
-fn wide_from_console_string(bytes: &[u8]) -> Vec<u16> {
-    assert!(bytes.len() < std::i32::MAX as usize);
-    let mut wide;
-    let mut len;
-    unsafe {
-        let cp = get_console_code_page();
-        len = multi_byte_to_wide_char(
-            cp,
-            0,
-            bytes.as_ptr() as *const u8,
-            bytes.len() as i32,
-            std::ptr::null_mut(),
-            0,
-        );
-        wide = Vec::with_capacity(len as usize);
-        len = multi_byte_to_wide_char(
-            cp,
-            0,
-            bytes.as_ptr() as *const u8,
-            bytes.len() as i32,
-            wide.as_mut_ptr(),
-            len,
-        );
-        wide.set_len(len as usize);
-    }
-    wide
-}
-
-#[cfg(target_family = "windows")]
-fn byte_array_to_os_string(bytes: &[u8]) -> OsString {
-    // first, use Windows API to convert to wide encoded
-    let wide = wide_from_console_string(bytes);
-    // then, use `std::os::windows::ffi::OsStringExt::from_wide()`
-    OsString::from_wide(&wide)
-}
-
-/// Runs the command `R RHOME` and returns the trimmed output if successful.
-/// Panics with a meaningful error message if the command fails.
 fn get_r_home() -> String {
-    // Attempt to run the command `R RHOME`
-    let output = Command::new("R").arg("RHOME").output(); // Capture the command's output
-
-    match output {
-        Ok(output) if output.status.success() => {
-            // Convert stdout to a String and trim it
-            String::from_utf8(output.stdout)
-                .expect("Invalid UTF-8 in RHOME output")
-                .trim()
-                .to_string()
-        }
-        Ok(output) => {
-            eprintln!(
-                "Error: Command `R RHOME` failed with status: {}\nStderr: {}",
-                output.status,
-                String::from_utf8_lossy(&output.stderr)
-            );
-            panic!("Failed to detect RHOME using `R RHOME`. Is R installed and in your PATH?");
-        }
-        Err(err) => {
-            panic!(
-                "Failed to execute `R RHOME`: {}. Is R installed and in your PATH?",
-                err
-            );
-        }
-    }
+    env::var("R_HOME").unwrap_or_else(|_| {
+        panic!("Error: the required environment variable R_HOME is not set");
+    })
 }
 
-// Execute an R CMD config and return the captured output
-fn r_cmd_config<S: AsRef<OsStr>>(r_binary: S) -> io::Result<OsString> {
-    let out = Command::new(r_binary)
+/// Run the command `R RHOME` and return the trimmed stdout output.
+///
+/// Panics with a helpful message if the command fails.
+// fn get_r_home() -> String {
+//     let output = Command::new("R")
+//         .arg("RHOME")
+//         .output()
+//         .expect("Failed to execute `R RHOME`. Is R installed and in your PATH?");
+//     if !output.status.success() {
+//         panic!(
+//             "Error: `R RHOME` failed:\n{}",
+//             String::from_utf8_lossy(&output.stderr)
+//         );
+//     }
+//     String::from_utf8_lossy(&output.stdout).trim().to_string()
+// }
+
+/// Run `R CMD config --all` using the provided R executable path and return its stdout as a String.
+fn r_cmd_config(r_binary: &Path) -> io::Result<String> {
+    let output = Command::new(r_binary)
         .args(&["CMD", "config", "--all"])
         .output()?;
-
-    // if there are any errors we print them out, helps with debugging
-    if !out.stderr.is_empty() {
-        println!(
-            "> {}",
-            byte_array_to_os_string(&out.stderr)
-                .as_os_str()
-                .to_string_lossy()
-        );
+    if !output.stderr.is_empty() {
+        println!("> {}", String::from_utf8_lossy(&output.stderr));
     }
-
-    Ok(byte_array_to_os_string(&out.stdout))
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// Build the configuration map by invoking R commands.
 fn build_r_cmd_configs() -> ConfigVariables {
-    let r_binary = format!(r"{}/bin/R", get_r_home());
-    let r_configs = r_cmd_config(r_binary);
+    let r_home = get_r_home();
 
-    let mut rcmd_config_map = HashMap::new();
-    match r_configs {
-        Ok(configs) => {
-            let input = configs.as_os_str().to_string_lossy();
-            for line in input.lines() {
-                // Ignore lines beyond comment marker
-                if line.starts_with("##") {
-                    break;
-                }
-                let parts: Vec<_> = line.split('=').map(str::trim).collect();
-                if let [name, value] = parts.as_slice() {
-                    rcmd_config_map.insert(name.to_string(), value.to_string());
-                }
-            }
+    // Determine the R executable path.
+    let r_binary: PathBuf = if cfg!(target_os = "windows") {
+        // On Windows R is typically installed in a subdirectory.
+        // Try the "x64" folder first (for 64-bit installations), then fall back.
+        let candidate = Path::new(&r_home).join("bin").join("x64").join("R.exe");
+        if candidate.exists() {
+            candidate
+        } else {
+            Path::new(&r_home).join("bin").join("R.exe")
         }
-        _ => (),
+    } else {
+        Path::new(&r_home).join("bin").join("R")
+    };
+
+    let configs = r_cmd_config(&r_binary).unwrap_or_default();
+    let mut rcmd_config_map = HashMap::new();
+
+    // Parse the output, expecting lines of the form KEY=VALUE.
+    for line in configs.lines() {
+        // Stop if we reach comments (the R output sometimes appends comments).
+        if line.starts_with("##") {
+            break;
+        }
+        let parts: Vec<&str> = line.split('=').map(str::trim).collect();
+        if parts.len() == 2 {
+            rcmd_config_map.insert(parts[0].to_string(), parts[1].to_string());
+        }
     }
-    // Return the struct
     ConfigVariables {
         map: rcmd_config_map,
     }
 }
 
-fn get_libs_and_paths(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
-    let mut paths: Vec<String> = Vec::new();
-    let mut libs: Vec<String> = Vec::new();
-
-    for s in &strings {
-        let parts: Vec<&str> = s.split_whitespace().collect();
-        for part in parts {
+/// Given a list of strings (such as BLAS, LAPACK, etc. flags),
+/// extract library paths (starting with "-L") and libraries (starting with "-l").
+fn get_libs_and_paths(strings: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut paths = Vec::new();
+    let mut libs = Vec::new();
+    for s in strings {
+        for part in s.split_whitespace() {
             if part.starts_with("-L") {
                 paths.push(part[2..].to_string());
             } else if part.starts_with("-l") {
@@ -185,27 +107,24 @@ fn get_libs_and_paths(strings: Vec<String>) -> (Vec<String>, Vec<String>) {
 
 fn main() {
     let r_configs = build_r_cmd_configs();
-    let (lib_paths, libs) = get_libs_and_paths(
-        [
-            r_configs.get_r_cmd_config("BLAS_LIBS"),
-            r_configs.get_r_cmd_config("LAPACK_LIBS"),
-            r_configs.get_r_cmd_config("FLIBS"),
-        ]
-        .to_vec(),
-    );
+    let config_strings = [
+        r_configs.get_r_cmd_config("BLAS_LIBS"),
+        r_configs.get_r_cmd_config("LAPACK_LIBS"),
+        r_configs.get_r_cmd_config("FLIBS"),
+    ];
+    let (lib_paths, libs) = get_libs_and_paths(&config_strings);
 
-    for path in lib_paths.iter() {
-        // Some R builds (e.g. homebrew) contain hardwired gfortran12
-        // paths, which may or may not exist if one has upgraded
-        // gfortran. So filter out non-existent ones, so that cargo
-        // doesn't complain.
-        if Path::new(path).exists() {
+    // Emit link search paths. Only output those that exist.
+    for path in lib_paths {
+        if Path::new(&path).exists() {
             println!("cargo:rustc-link-search={}", path);
+	    eprintln!("cargo:rustc-link-search={}", path);
         }
     }
-
-    for lib in libs.iter() {
+    // Emit libraries for the linker.
+    for lib in libs {
         println!("cargo:rustc-link-lib=dylib={}", lib);
+	eprintln!("cargo:rustc-link-lib=dylib={}", lib);
     }
     println!("cargo:rerun-if-changed=build.rs");
 }
